@@ -323,57 +323,95 @@ def _check(name, ref, got, rtol, atol):
     )
 
 
-# Shapes chosen to cover:
-# - Q == K causal (the previously-working path)
-# - Q < K noncausal (chunked-context path)
-# - kv_split_per_qtile > cus_per_cluster (the sizing-bug regime)
-# - num_splits == 1 tiles (the LSE-bug regime: small batches, single q-tile)
-# - varlen across the batch (mixed split counts)
+# Shapes derived from how vLLM's MLACommonMetadataBuilder builds prefill
+# chunked-context metadata (vllm/model_executor/layers/attention/mla_attention.py
+# lines 1628-1709). Key facts that constrain the realistic shape space:
+#
+#   - Decode tokens go through the decode backend, NOT this prefill kernel.
+#     The noncausal kernel only ever sees prefill requests, so batch sizes
+#     here are small (typically 1-8).
+#   - Q per request = new prefill tokens (NOT cached context).
+#   - K per request per chunk is computed by:
+#         max_context_chunk = workspace_size // num_prefills_with_context
+#         num_chunks        = cdiv(max_context_len, max_context_chunk)
+#         chunk_start       = chunk_idx * max_context_chunk
+#         chunk_end         = min(context_len, chunk_start + max_context_chunk)
+#         k_per_seq         = (chunk_end - chunk_start).clamp(min=0)
+#     so a sequence with context_len < chunk_start has K=0 in that chunk.
+#   - Q is the same across all chunks for a given prefill step (vLLM loops
+#     chunks with the same query tensor).
 @pytest.mark.parametrize(
     "name,seq_lens_q,seq_lens_kv,is_causal",
     [
+        # --- Causal baselines (new-tokens chunk path) ---
         # LSE-bug regime: single batch, single q-tile, num_splits==1.
         ("causal_single_unsplit", [128], [128], True),
-        # Causal multi-batch baseline.
+        # Mixed prefill query lengths, all causal.
         ("causal_varlen_small", [128, 256, 384], [128, 256, 384], True),
-        # Noncausal Q << K (chunked-context shape, small).
-        ("noncausal_q64_k1024", [64, 64], [1024, 1024], False),
-        # Noncausal large-KV regime that triggers the sizing bug.
-        # max_kv_split_per_qtile = ceil(8192/128) = 64, far above cus_per_cluster.
-        ("noncausal_q128_k8192", [128, 128], [8192, 8192], False),
-        # Varlen noncausal: mixed K lengths, including a sequence with very
-        # large K to exercise both the sizing fix and the dedup in reduce.
-        ("noncausal_varlen_mixed", [96, 192, 64], [4096, 8000, 1024], False),
-        # Causal large-context (matches dsv3 prefill chunk shape).
+        # Large single prefill (one full prefill chunk).
         ("causal_large", [4096], [4096], True),
-        # Chunked-context shapes where MOST sequences have K=0 for this chunk
-        # (the realistic vLLM case: only the few sequences whose cached context
-        # extends into this chunk contribute K; the rest have K=0 and the
-        # scheduler must skip their q-tiles cleanly). Decode-heavy batches
-        # have q=1 per sequence with sparse K coverage.
+
+        # --- Scenario A: single chunk, uniform context (no zero-K) ---
+        # 3 prefills, each with 2691 new tokens and 8000 cached tokens, all
+        # fitting in one workspace chunk. This is the "common path" noncausal
+        # call for medium-context prefill batches.
+        ("ctx_A_uniform_3x8000", [2691, 2691, 2691], [8000, 8000, 8000], False),
+
+        # --- Scenario B: multi-chunk, varied context lengths ---
+        # 4 prefills with context_lens=[2000,8000,16000,32000], workspace
+        # forces max_context_chunk=8192. Q per prefill = 1024.
+        # chunk 0: K = [2000, 8000, 8192, 8192]  (no zeros yet)
+        ("ctx_B_chunk0_no_zero", [1024, 1024, 1024, 1024], [2000, 8000, 8192, 8192], False),
+        # chunk 1: short seqs drop out
+        ("ctx_B_chunk1_two_zero", [1024, 1024, 1024, 1024], [0, 0, 7808, 8192], False),
+        # chunk 2: only longest seq remains
+        ("ctx_B_chunk2_three_zero", [1024, 1024, 1024, 1024], [0, 0, 0, 8192], False),
+        # chunk 3: tail of longest seq, partial chunk
+        ("ctx_B_chunk3_tail", [1024, 1024, 1024, 1024], [0, 0, 0, 7424], False),
+
+        # --- Scenario C: one huge prefill alone, multi-chunk ---
+        # batch=1, context=16384 split into 4 chunks of 4096 each. Q=8192.
+        # This is the "long-context-document" prefill shape.
+        ("ctx_C_single_huge_chunk0", [8192], [4096], False),
+        ("ctx_C_single_huge_mid", [8192], [4096], False),
+        ("ctx_C_single_huge_last", [8192], [4096], False),
+
+        # --- Scenario D: very mixed batch, multi-chunk, sparse zeros ---
+        # 6 prefills, varied Q and varied context. workspace gives
+        # max_context_chunk ~ 5440 (page-aligned). Pick one chunk that has
+        # the "interesting" pattern: some non-empty short, some non-empty
+        # long, some already-finished short ones at zero.
+        # context_lens = [500, 1500, 8000, 32000, 800, 4500]
+        # at chunk 0: K = [500, 1500, 5440, 5440, 800, 4500]
         (
-            "noncausal_sparse_k_decode_heavy",
-            [1] * 16 + [1],
-            [0] * 16 + [8000],
+            "ctx_D_varied_chunk0",
+            [256, 512, 1024, 256, 2048, 512],
+            [500, 1500, 5440, 5440, 800, 4500],
             False,
         ),
+        # at chunk 1: K = [0, 0, 2560, 5440, 0, 0]  (most seqs done)
         (
-            "noncausal_sparse_k_mixed",
-            [1] * 8 + [500] + [1] * 8,
-            [0, 0, 4096, 0, 0, 8000, 0, 0, 500, 0, 0, 0, 8000, 0, 0, 0, 0],
+            "ctx_D_varied_chunk1_mostly_zero",
+            [256, 512, 1024, 256, 2048, 512],
+            [0, 0, 2560, 5440, 0, 0],
             False,
         ),
-        # Big prefill seq alongside many zero-K decode tokens (the dsv3
-        # context_3(8073)_generation_119(119) shape, scaled down).
+        # at chunk 5 (last): K = [0, 0, 0, 5120, 0, 0]  (single survivor, tail)
         (
-            "noncausal_one_prefill_many_zero_k",
-            [7893] + [1] * 119,
-            [8000] + [0] * 119,
+            "ctx_D_varied_chunk_last_one_survivor",
+            [256, 512, 1024, 256, 2048, 512],
+            [0, 0, 0, 5120, 0, 0],
             False,
         ),
-        # All-zero K: every sequence has K=0 for this chunk. num_partial_tiles
-        # should be 0 and the kernel must not OOB on empty work.
-        ("noncausal_all_zero_k", [1] * 8, [0] * 8, False),
+
+        # --- Scenario E: single prefill with K > Q (decode just finished
+        # filling context, next step has 1 new prefill token + large ctx) ---
+        ("ctx_E_q1_k8192", [1], [8192], False),
+
+        # --- Edge: every prefill has K=0 in this chunk (last chunk past all
+        # but already-completed short seqs). Kernel must not OOB on empty
+        # work; vLLM should ideally early-return before calling. ---
+        ("ctx_all_zero_k_batch3", [1024, 1024, 1024], [0, 0, 0], False),
     ],
 )
 @pytest.mark.parametrize("num_heads", [1, 16])
