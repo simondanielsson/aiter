@@ -362,10 +362,6 @@ def _check(name, ref, got, rtol, atol):
 def test_asm_kernel_pair_matches_torch(
     name, seq_lens_q, seq_lens_kv, is_causal, num_heads
 ):
-    if not is_causal:
-        for sq, sk in zip(seq_lens_q, seq_lens_kv):
-            assert sq <= sk, "noncausal requires Q <= K per sequence"
-
     softmax_scale = 1.0 / math.sqrt(_QK_HEAD_DIM)
     q_bf16, kv_bf16, qo_indptr, kv_indptr, kv_indices, seq_lens_kv_t = _make_inputs(
         seq_lens_q, seq_lens_kv, num_heads
