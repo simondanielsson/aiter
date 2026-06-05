@@ -196,6 +196,17 @@ def _run_asm_kernel_pair(
     total_q, num_heads, _ = q_bf16.shape
     max_qlen = int((qo_indptr[1:] - qo_indptr[:-1]).max().item())
 
+    # per_tensor_quant calls .abs().max() which crashes on 0-element input.
+    # For the degenerate all-K-empty case, swap in a 1-row dummy KV that the
+    # kernel never indexes (all kv_indptr deltas are 0 so no work references
+    # any K position).
+    if kv_bf16.shape[0] == 0:
+        kv_bf16 = torch.zeros(
+            (1, num_heads, _QK_HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
     q_quant, q_scale = per_tensor_quant(q_bf16, quant_dtype=dtypes.fp8)
     k_quant, k_scale = per_tensor_quant(kv_bf16, quant_dtype=dtypes.fp8)
     v_quant, v_scale = per_tensor_quant(
@@ -209,14 +220,21 @@ def _run_asm_kernel_pair(
     output = torch.zeros(
         (total_q, num_heads, _V_HEAD_DIM), dtype=torch.bfloat16, device=device
     )
-    n_partial_slots = meta["reduce_partial_map"].size(0)
+    # Size partial buffers by the actual scheduler-emitted partial-tile count
+    # (reduce_indptr[-1]), NOT by reduce_partial_map.numel(), which is the
+    # static upper bound on the scratch map and can be orders of magnitude
+    # larger than what the scheduler actually emits. vLLM does the same.
+    num_partial_tiles = int(meta["reduce_indptr"][-1].item())
+    # Guarantee at least 1 slot so the allocations succeed even when the
+    # scheduler emits zero work; the kernel won't write to them.
+    partial_alloc_rows = max(num_partial_tiles, 1) * _TILE_Q
     partial_out = torch.zeros(
-        (n_partial_slots * _TILE_Q, num_heads, _V_HEAD_DIM),
+        (partial_alloc_rows, num_heads, _V_HEAD_DIM),
         dtype=dtypes.fp32,
         device=device,
     )
     partial_lse = torch.full(
-        (n_partial_slots * _TILE_Q, num_heads),
+        (partial_alloc_rows, num_heads),
         float("-inf"),
         dtype=dtypes.fp32,
         device=device,
