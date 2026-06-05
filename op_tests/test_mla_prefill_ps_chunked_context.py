@@ -328,6 +328,34 @@ def _check(name, ref, got, rtol, atol):
         ("noncausal_varlen_mixed", [96, 192, 64], [4096, 8000, 1024], False),
         # Causal large-context (matches dsv3 prefill chunk shape).
         ("causal_large", [4096], [4096], True),
+        # Chunked-context shapes where MOST sequences have K=0 for this chunk
+        # (the realistic vLLM case: only the few sequences whose cached context
+        # extends into this chunk contribute K; the rest have K=0 and the
+        # scheduler must skip their q-tiles cleanly). Decode-heavy batches
+        # have q=1 per sequence with sparse K coverage.
+        (
+            "noncausal_sparse_k_decode_heavy",
+            [1] * 16 + [1],
+            [0] * 16 + [8000],
+            False,
+        ),
+        (
+            "noncausal_sparse_k_mixed",
+            [1] * 8 + [500] + [1] * 8,
+            [0, 0, 4096, 0, 0, 8000, 0, 0, 500, 0, 0, 0, 8000, 0, 0, 0, 0],
+            False,
+        ),
+        # Big prefill seq alongside many zero-K decode tokens (the dsv3
+        # context_3(8073)_generation_119(119) shape, scaled down).
+        (
+            "noncausal_one_prefill_many_zero_k",
+            [7893] + [1] * 119,
+            [8000] + [0] * 119,
+            False,
+        ),
+        # All-zero K: every sequence has K=0 for this chunk. num_partial_tiles
+        # should be 0 and the kernel must not OOB on empty work.
+        ("noncausal_all_zero_k", [1] * 8, [0] * 8, False),
     ],
 )
 @pytest.mark.parametrize("num_heads", [1, 16])
@@ -372,14 +400,22 @@ def test_asm_kernel_pair_matches_torch(
     # accumulated in fp8 path, so allow a similar tolerance.
     lse_asm_t = lse_asm.transpose(0, 1)  # [h, total_q]
     finite_mask = torch.isfinite(lse_ref)
-    assert finite_mask.any(), "reference LSE is all -inf (degenerate test)"
-    _check(
-        f"{name}/lse",
-        lse_ref[finite_mask],
-        lse_asm_t[finite_mask],
-        rtol=5e-2,
-        atol=5e-2,
-    )
+    if finite_mask.any():
+        _check(
+            f"{name}/lse",
+            lse_ref[finite_mask],
+            lse_asm_t[finite_mask],
+            rtol=5e-2,
+            atol=5e-2,
+        )
+    else:
+        # All-zero-K case: reference LSE is all -inf. The kernel must not
+        # crash; we just verify it returned without faulting (already true
+        # if we got here) and that the ASM LSE is also fully -inf at the
+        # positions the reference flagged.
+        assert not torch.isfinite(lse_asm_t).any(), (
+            f"[{name}/lse] expected all -inf but got finite values"
+        )
 
 
 def test_lse_is_written_for_unsplit_tile():
